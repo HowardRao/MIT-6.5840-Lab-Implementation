@@ -1,3 +1,11 @@
 {
-    "makefile.configureOnOpen": false
+"[go]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "golang.go" // 指定 Go 插件作为默认格式化器
+},
+"go.formatTool": "gofmt",
+"makefile.configureOnOpen": false // 可选: gofmt, goimports, 或 goreturns
 }

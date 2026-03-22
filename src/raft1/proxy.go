@@ -4,7 +4,7 @@ import (
 	"log"
 
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 // For Raft RPCs from tester to Raft server

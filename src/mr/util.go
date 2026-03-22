@@ -40,7 +40,6 @@ func runMRchan(files []string, app string, n int, c chan int, sock string) {
 	if err := coord.Start(); err != nil {
 		log.Fatalf("mr failed %v", err)
 	}
-
 	// give the coordinator time to create the sockets.
 	time.Sleep(1 * time.Second)
 

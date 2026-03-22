@@ -1,83 +1,201 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
-
-// Map functions return a slice of KeyValue.
+// Define struct
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
+// Hash function
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-var coordSockName string // socket for coordinator
+var coordSockName string
 
-
-// main/mrworker.go calls this function.
-func Worker(sockname string, mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+// Define worker function
+func Worker(sockname string,
+	mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
 	coordSockName = sockname
 
-	// Your worker implementation here.
+	args := RPCArgs{
+		DoneTaskType: InitTask,
+		DoneTaskID:   -1,
+	}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	for {
 
-}
+		// RPC call
+		reply := RPCReply{}
+		ok := call("Coordinator.AssignTask", &args, &reply)
+		if !ok {
+			time.Sleep(time.Second)
+			continue
+		}
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+		// reset
+		args.DoneTaskID = -1
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+		// Confirm the processing procedure according to the task type
+		switch reply.TaskType {
 
-	// fill in the argument(s).
-	args.X = 99
+		case MapTask:
+			log.Printf("worker received a map task %d/%d, processing...", reply.TaskID, reply.NMap)
+			doMapTask(mapf, &reply)
+			args.DoneTaskID = reply.TaskID
+			args.DoneTaskType = MapTask
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+		case ReduceTask:
+			log.Printf("worker received a reduce task %d/%d, processing...", reply.TaskID, reply.NReduce)
+			doReduceTask(reducef, &reply)
+			args.DoneTaskID = reply.TaskID
+			args.DoneTaskType = ReduceTask
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		case InitTask, MapWait, ReduceWait:
+			// log.Printf("worker received an other task.")
+			time.Sleep(time.Second)
+
+		case ExitTask:
+			// log.Printf("worker is ready to exit.")
+			return
+		}
 	}
 }
 
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
+func doMapTask(mapf func(string, string) []KeyValue, reply *RPCReply) {
+
+	file, err := os.Open(reply.Filename)
+	if err != nil {
+		panic(err)
+	}
+	content, err := io.ReadAll(file)
+	file.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	kva := mapf(reply.Filename, string(content))
+
+	buckets := make([][]KeyValue, reply.NReduce)
+
+	for _, kv := range kva {
+		r := ihash(kv.Key) % reply.NReduce
+		buckets[r] = append(buckets[r], kv)
+	}
+
+	for r := 0; r < reply.NReduce; r++ {
+
+		tmp, err := os.CreateTemp(".", "mr-map-*")
+		if err != nil {
+			panic(err)
+		}
+
+		enc := json.NewEncoder(tmp)
+
+		for _, kv := range buckets[r] {
+			if err := enc.Encode(&kv); err != nil {
+				panic(err)
+			}
+		}
+
+		tmp.Close()
+
+		// Atomic file process
+		oname := fmt.Sprintf("mr-part-%d-%d", reply.TaskID, r)
+		os.Rename(tmp.Name(), oname)
+	}
+}
+
+func doReduceTask(reducef func(string, []string) string, reply *RPCReply) {
+
+	intermediate := []KeyValue{}
+
+	// Aggregate the Key-value pairs from various files.
+	for m := 0; m < reply.NMap; m++ {
+
+		name := fmt.Sprintf("mr-part-%d-%d", m, reply.TaskID)
+
+		file, err := os.Open(name)
+		if err != nil {
+			continue
+		}
+
+		dec := json.NewDecoder(file)
+
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+
+		file.Close()
+	}
+
+	// Sort all key-value pair
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+
+	tmp, err := os.CreateTemp(".", "mr-out-*")
+	if err != nil {
+		panic(err)
+	}
+
+	// Count the number of consecutive identical primary keys
+	i := 0
+	for i < len(intermediate) {
+
+		j := i + 1
+		for j < len(intermediate) &&
+			intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(tmp, "%v %v\n",
+			intermediate[i].Key,
+			output)
+
+		i = j
+	}
+
+	tmp.Close()
+
+	oname := fmt.Sprintf("mr-out-%d", reply.TaskID)
+	os.Rename(tmp.Name(), oname)
+}
+
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+
 	c, err := rpc.DialHTTP("unix", coordSockName)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
-	if err := c.Call(rpcname, args, reply); err == nil {
-		return true
-	}
-	log.Printf("%d: call failed err %v", os.Getpid(), err)
-	return false
+	err = c.Call(rpcname, args, reply)
+	return err == nil
 }
